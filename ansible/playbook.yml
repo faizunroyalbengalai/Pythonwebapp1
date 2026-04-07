@@ -1,0 +1,350 @@
+---
+- name: Deploy Python app on EC2
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    app_port: 8000
+    app_user: ubuntu
+    app_name: pythonwebapp1
+    python_version: "3.12"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - nginx
+          - git
+          - curl
+          - build-essential
+        state: present
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: Install local database (postgres) if requested
+      block:
+        - name: Install PostgreSQL
+          apt:
+            name:
+              - postgresql
+              - postgresql-contrib
+              - libpq-dev
+            state: present
+
+        - name: Start and enable PostgreSQL
+          systemd:
+            name: postgresql
+            state: started
+            enabled: yes
+
+        - name: Fix pg_hba.conf scram-sha-256 to md5
+          shell: |
+            HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+            sed -i 's/scram-sha-256/md5/g' "$HBA"
+          args:
+            executable: /bin/bash
+
+        - name: Reload PostgreSQL after hba change
+          systemd:
+            name: postgresql
+            state: reloaded
+
+        - name: Create PostgreSQL database
+          shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+          args:
+            executable: /bin/bash
+          when: db_name is defined and db_name != ''
+
+        - name: Create PostgreSQL user
+          shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH ENCRYPTED PASSWORD '{{ db_password }}';"
+          args:
+            executable: /bin/bash
+          when: db_username is defined and db_username != '' and db_password is defined and db_password != ''
+
+        - name: Grant privileges to PostgreSQL user
+          shell: |
+            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+          args:
+            executable: /bin/bash
+          when: db_name is defined and db_name != '' and db_username is defined and db_username != ''
+      when: install_db is defined and install_db == 'true' and db_type is defined and db_type == 'postgres'
+
+    - name: Install local database (mysql) if requested
+      block:
+        - name: Install MySQL
+          apt:
+            name:
+              - mysql-server
+              - mysql-client
+              - python3-mysqldb
+            state: present
+
+        - name: Start and enable MySQL
+          systemd:
+            name: mysql
+            state: started
+            enabled: yes
+
+        - name: Create MySQL database
+          shell: |
+            mysql -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+          args:
+            executable: /bin/bash
+          when: db_name is defined and db_name != ''
+
+        - name: Create MySQL user and grant privileges
+          shell: |
+            mysql -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'localhost' IDENTIFIED BY '{{ db_password }}'; GRANT ALL ON {{ db_name }}.* TO '{{ db_username }}'@'localhost'; FLUSH PRIVILEGES;"
+          args:
+            executable: /bin/bash
+          when: db_username is defined and db_username != '' and db_password is defined and db_password != ''
+      when: install_db is defined and install_db == 'true' and db_type is defined and db_type == 'mysql'
+
+    - name: Install local database (mongodb) if requested
+      block:
+        - name: Install MongoDB prerequisites
+          apt:
+            name:
+              - gnupg
+              - curl
+            state: present
+
+        - name: Add MongoDB apt key
+          shell: |
+            curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | \
+              gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg
+          args:
+            creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+            executable: /bin/bash
+
+        - name: Add MongoDB apt repository
+          copy:
+            content: |
+              deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse
+            dest: /etc/apt/sources.list.d/mongodb-org-7.0.list
+
+        - name: Update apt cache after adding MongoDB repo
+          apt:
+            update_cache: yes
+
+        - name: Install mongodb-org
+          apt:
+            name: mongodb-org
+            state: present
+
+        - name: Start and enable mongod
+          systemd:
+            name: mongod
+            state: started
+            enabled: yes
+
+        - name: Initialize MongoDB collection
+          shell: |
+            mongosh --eval 'db.getSiblingDB("{{ db_name }}").createCollection("init")'
+          args:
+            executable: /bin/bash
+          when: db_name is defined and db_name != ''
+      when: install_db is defined and install_db == 'true' and db_type is defined and db_type == 'mongodb'
+
+    - name: Clone or pull app from GitHub
+      git:
+        repo: "https://github.com/{{ lookup('env', 'GITHUB_REPOSITORY') }}.git"
+        dest: "{{ app_dir }}"
+        version: HEAD
+        force: yes
+      environment:
+        GIT_TERMINAL_PROMPT: "0"
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Set ownership of app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: Write .env file
+      copy:
+        content: |
+          {% if database_url is defined and database_url != '' %}
+          DATABASE_URL={{ database_url }}
+          {% endif %}
+          {% if mongo_uri is defined and mongo_uri != '' %}
+          MONGO_URI={{ mongo_uri }}
+          {% endif %}
+          {% if db_host is defined and db_host != '' %}
+          DB_HOST={{ db_host }}
+          {% endif %}
+          {% if db_port is defined and db_port != '' %}
+          DB_PORT={{ db_port }}
+          {% endif %}
+          {% if db_name is defined and db_name != '' %}
+          DB_NAME={{ db_name }}
+          {% endif %}
+          {% if db_user is defined and db_user != '' %}
+          DB_USER={{ db_user }}
+          {% endif %}
+          {% if db_password is defined and db_password != '' %}
+          DB_PASSWORD={{ db_password }}
+          {% endif %}
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
+
+    - name: Create virtualenv
+      shell: python3 -m venv {{ app_dir }}/venv
+      args:
+        creates: "{{ app_dir }}/venv/bin/activate"
+        executable: /bin/bash
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip in virtualenv
+      shell: "{{ app_dir }}/venv/bin/pip install --upgrade pip"
+      args:
+        executable: /bin/bash
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Install gunicorn and uvicorn in virtualenv
+      shell: "{{ app_dir }}/venv/bin/pip install gunicorn uvicorn"
+      args:
+        executable: /bin/bash
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Check if requirements.txt exists
+      stat:
+        path: "{{ app_dir }}/requirements.txt"
+      register: requirements_stat
+
+    - name: Install Python requirements
+      shell: "{{ app_dir }}/venv/bin/pip install -r {{ app_dir }}/requirements.txt"
+      args:
+        executable: /bin/bash
+      become: yes
+      become_user: "{{ app_user }}"
+      when: requirements_stat.stat.exists
+
+    - name: Create systemd service for app
+      copy:
+        content: |
+          [Unit]
+          Description=pythonwebapp1 Python App
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ app_dir }}/venv/bin/gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+          Restart=on-failure
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/app.service
+        mode: '0644'
+      notify: restart app
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Start and enable app service
+      systemd:
+        name: app
+        state: started
+        enabled: yes
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+
+    - name: Configure nginx reverse proxy
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_read_timeout 120s;
+              }
+          }
+        dest: /etc/nginx/sites-enabled/app
+        mode: '0644'
+      notify: restart nginx
+
+    - name: Start and enable nginx
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Wait for app to be available on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: 8000
+        timeout: 120
+        delay: 10
+      register: app_wait
+      ignore_errors: yes
+
+    - name: Show journalctl logs if app did not start
+      shell: journalctl -u app -n 50 --no-pager
+      args:
+        executable: /bin/bash
+      when: app_wait is failed
+
+    - name: Confirm deployment success
+      debug:
+        msg: "server_ip={{ ansible_host }}"
+      when: app_wait is succeeded
+
+  handlers:
+    - name: restart app
+      systemd:
+        name: app
+        state: restarted
+        daemon_reload: yes
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
